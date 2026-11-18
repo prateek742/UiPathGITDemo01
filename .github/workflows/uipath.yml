@@ -1,1 +1,381 @@
 
+name: UiPath CI-CD - GitHub Hosted
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uipath-deployment-main
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '26.13.0'
+  NPM_VERSION: '11.20.0'
+  UIPATH_CLI_VERSION: '1.205.0'
+
+  PROJECT_PATH: '.'
+  OUTPUT_PATH: '../uipath-build-output'
+  ORCHESTRATOR_FOLDER: 'Shared'
+
+jobs:
+
+  build-and-deploy:
+
+    name: Build and Deploy UiPath Automation
+
+    runs-on: windows-latest
+
+    steps:
+
+      # ------------------------------------------
+      # 1. Checkout GitHub repository
+      # ------------------------------------------
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # ------------------------------------------
+      # 2. Setup exact Node.js version
+      # ------------------------------------------
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # ------------------------------------------
+      # 3. Setup .NET
+      # ------------------------------------------
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+
+      # ------------------------------------------
+      # 4. Install exact npm version
+      # ------------------------------------------
+
+      - name: Install npm
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          npm install --global "npm@$env:NPM_VERSION"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "npm installation failed"
+          }
+
+          Write-Host "Node.js version:"
+          node --version
+
+          Write-Host "npm version:"
+          npm --version
+
+      # ------------------------------------------
+      # 5. Install exact UiPath CLI version
+      # ------------------------------------------
+
+      - name: Install UiPath CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          npm install --global "@uipath/cli@$env:UIPATH_CLI_VERSION"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "UiPath CLI installation failed"
+          }
+
+          uip --version
+
+      # ------------------------------------------
+      # 6. Validate environment and project
+      # ------------------------------------------
+
+      - name: Validate environment
+        id: metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Node.js:"
+          node --version
+
+          Write-Host "npm:"
+          npm --version
+
+          Write-Host "UiPath CLI:"
+          uip --version
+
+          Write-Host ".NET runtimes:"
+          dotnet --list-runtimes
+
+          Write-Host "Checking project.json..."
+
+          $projectFile = Join-Path $env:PROJECT_PATH "project.json"
+
+          if (!(Test-Path $projectFile)) {
+            throw "project.json not found in repository root"
+          }
+
+          $project = Get-Content $projectFile -Raw |
+            ConvertFrom-Json
+
+          $projectName = $project.name
+          $projectVersion = $project.projectVersion
+          $targetFramework = $project.targetFramework
+
+          if (!$projectName -or !$projectVersion) {
+            throw "Project name or version missing"
+          }
+
+          if ($targetFramework -eq "Windows-Legacy") {
+            throw "Windows-Legacy requires a separate legacy packaging workflow."
+          }
+
+          Write-Host "Project: $projectName"
+          Write-Host "Version: $projectVersion"
+          Write-Host "Framework: $targetFramework"
+
+          if ($projectVersion -notmatch '^(\d+)\.(\d+)\.(\d+)$') {
+            throw "Expected projectVersion in MAJOR.MINOR.PATCH format"
+          }
+
+          $major = $Matches[1]
+          $minor = $Matches[2]
+
+          $buildNumber = [long]$env:GITHUB_RUN_NUMBER
+          $attempt = [long]$env:GITHUB_RUN_ATTEMPT
+
+          $patch = ($buildNumber * 100) + $attempt
+
+          $packageVersion = "$major.$minor.$patch"
+
+          "project_name=$projectName" >> $env:GITHUB_OUTPUT
+          "package_version=$packageVersion" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Build package version: $packageVersion"
+
+      # ------------------------------------------
+      # 7. Authenticate with UiPath External App
+      # ------------------------------------------
+
+      - name: Authenticate with UiPath
+        shell: pwsh
+        env:
+          UIPATH_CLIENT_ID: ${{ secrets.UIPATH_CLIENT_ID }}
+          UIPATH_CLIENT_SECRET: ${{ secrets.UIPATH_CLIENT_SECRET }}
+          UIPATH_TENANT: ${{ secrets.UIPATH_TENANT }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (!$env:UIPATH_CLIENT_ID -or
+              !$env:UIPATH_CLIENT_SECRET -or
+              !$env:UIPATH_TENANT) {
+            throw "UiPath authentication secrets are missing"
+          }
+
+          uip login `
+            --client-id env.UIPATH_CLIENT_ID `
+            --client-secret env.UIPATH_CLIENT_SECRET `
+            --tenant "$env:UIPATH_TENANT"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "UiPath authentication failed"
+          }
+
+          Write-Host "UiPath authentication successful"
+
+      # ------------------------------------------
+      # 8. Package UiPath Studio project
+      # IMPORTANT: Output is outside project root
+      # ------------------------------------------
+
+      - name: Build UiPath package
+        id: package
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.package_version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $outputPath = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            $env:OUTPUT_PATH
+
+          $projectRoot = [System.IO.Path]::GetFullPath(
+            $env:GITHUB_WORKSPACE
+          )
+
+          $resolvedOutput = [System.IO.Path]::GetFullPath(
+            $outputPath
+          )
+
+          if ($resolvedOutput.StartsWith(
+            $projectRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+          )) {
+            throw "Package output must be outside project directory"
+          }
+
+          New-Item -ItemType Directory `
+            -Path $resolvedOutput `
+            -Force | Out-Null
+
+          Write-Host "Packaging UiPath project..."
+          Write-Host "Project: $projectRoot"
+          Write-Host "Output: $resolvedOutput"
+
+          uip rpa pack `
+            "$projectRoot" `
+            "$resolvedOutput" `
+            --package-version "$env:PACKAGE_VERSION"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "UiPath packaging failed"
+          }
+
+          $packages = @(
+            Get-ChildItem $resolvedOutput `
+              -Filter "*.nupkg" `
+              -File
+          )
+
+          if ($packages.Count -ne 1) {
+            throw "Expected exactly one NuGet package. Found $($packages.Count)"
+          }
+
+          $packagePath = $packages[0].FullName
+
+          Write-Host "Package created: $packagePath"
+
+          "package_path=$packagePath" >> $env:GITHUB_OUTPUT
+
+      # ------------------------------------------
+      # 9. Upload package to Orchestrator
+      # ------------------------------------------
+
+      - name: Publish package to Orchestrator
+        shell: pwsh
+        env:
+          PACKAGE_PATH: ${{ steps.package.outputs.package_path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Uploading package..."
+
+          uip or packages upload "$env:PACKAGE_PATH"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Orchestrator package upload failed"
+          }
+
+          Write-Host "Package uploaded successfully"
+
+      # ------------------------------------------
+      # 10. Create or update Orchestrator process
+      # ------------------------------------------
+
+      - name: Create or update process
+        shell: pwsh
+        env:
+          PROCESS_NAME: ${{ steps.metadata.outputs.project_name }}
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.package_version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Checking Orchestrator process..."
+
+          $processJson = & uip or processes list `
+            --folder-path "$env:ORCHESTRATOR_FOLDER" `
+            --name "$env:PROCESS_NAME" `
+            --output json
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not retrieve Orchestrator processes"
+          }
+
+          $processResult = ($processJson -join "`n") |
+            ConvertFrom-Json
+
+          $existingProcesses = @(
+            $processResult.Data | Where-Object {
+              $_.Name -eq $env:PROCESS_NAME
+            }
+          )
+
+          if ($existingProcesses.Count -eq 0) {
+
+            Write-Host "Process not found. Creating new process..."
+
+            uip or processes create `
+              --folder-path "$env:ORCHESTRATOR_FOLDER" `
+              --name "$env:PROCESS_NAME" `
+              --package-key "$env:PROCESS_NAME" `
+              --package-version "$env:PACKAGE_VERSION"
+
+          }
+          else {
+
+            $processKey = $existingProcesses[0].Key
+
+            Write-Host "Existing process found: $processKey"
+
+            uip or processes update-version `
+              "$processKey" `
+              --package-version "$env:PACKAGE_VERSION" `
+              --folder-path "$env:ORCHESTRATOR_FOLDER"
+
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Process creation or version update failed"
+          }
+
+          Write-Host "Orchestrator process deployment completed"
+
+      # ------------------------------------------
+      # 11. Logout
+      # ------------------------------------------
+
+      - name: Logout from UiPath
+        if: always()
+        shell: pwsh
+        run: |
+          uip logout
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "UiPath logout returned an error"
+          }
+
+      # ------------------------------------------
+      # 12. Deployment summary
+      # ------------------------------------------
+
+      - name: Deployment summary
+        if: success()
+        shell: pwsh
+        env:
+          PROJECT_NAME: ${{ steps.metadata.outputs.project_name }}
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.package_version }}
+        run: |
+          @"
+          ## UiPath CI/CD Deployment Successful
+
+          - Project: $env:PROJECT_NAME
+          - Package version: $env:PACKAGE_VERSION
+          - Branch: main
+          - Runner: GitHub-hosted Windows
+          - Orchestrator folder: Shared
+          - Status: Successful
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
